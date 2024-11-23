@@ -3,7 +3,12 @@ AFRAME.registerComponent("gaussian_splatting", {
 		src: {type: 'string', default: "train.splat"},
 		cutoutEntity: {type: 'selector'},
 		pixelRatio: {type: 'number', default: 1},
-		xrPixelRatio: {type: 'number', default: 0.5}
+		xrPixelRatio: {type: 'number', default: 0.5},
+		//距离映射
+		realMinDistance: {type: 'number', default: 0},    // 真实最小距离(米)
+		realMaxDistance: {type: 'number', default: 7.5},  // 真实最大距离(米)
+		renderMinDistance: {type: 'number', default: 0},  // 渲染最小距离(米)
+		renderMaxDistance: {type: 'number', default: 1.5} // 渲染最大距离(米)	
 	},
 	init: function () {
 		// aframe-specific data
@@ -21,6 +26,20 @@ AFRAME.registerComponent("gaussian_splatting", {
 			}
 		})
 	},
+
+	//MapDitance距离映射函数
+	mapDistance: function(realDistance) {
+        const realRange = this.data.realMaxDistance - this.data.realMinDistance;
+        const renderRange = this.data.renderMaxDistance - this.data.renderMinDistance;
+        
+        realDistance = Math.max(this.data.realMinDistance, 
+                             Math.min(this.data.realMaxDistance, realDistance));
+        
+        const mappedDistance = this.data.renderMinDistance + 
+            (realDistance - this.data.realMinDistance) * (renderRange / realRange);
+            
+        return mappedDistance;
+    },
 	// also works from vanilla three.js
 	initGL: async function(numVertexes){
 		console.log("initGL", numVertexes);
@@ -65,115 +84,103 @@ AFRAME.registerComponent("gaussian_splatting", {
 		geometry.setAttribute('splatIndex', splatIndexes);
 		geometry.instanceCount = 1;
 
-			const material = new THREE.ShaderMaterial({
-				uniforms: {
-					viewport: {value: new Float32Array([1980, 1080])},
-					focal: {value: 1000.0},
-					centerAndScaleTexture: {value: this.centerAndScaleTexture},
-					covAndColorTexture: {value: this.covAndColorTexture},
-					gsProjectionMatrix: {value: this.getProjectionMatrix()},
-					gsModelViewMatrix: {value: this.getModelViewMatrix()},
-				},
-				vertexShader: `
-					precision highp sampler2D;
-					precision highp usampler2D;
+		const material = new THREE.ShaderMaterial( {
+			uniforms : {
+				viewport: {value: new Float32Array([1980, 1080])}, // Dummy. will be overwritten
+				focal: {value: 1000.0}, // Dummy. will be overwritten
+				centerAndScaleTexture: {value: this.centerAndScaleTexture},
+				covAndColorTexture: {value: this.covAndColorTexture},
+				gsProjectionMatrix: {value: this.getProjectionMatrix()},
+				gsModelViewMatrix: {value: this.getModelViewMatrix()},
+			},
+			vertexShader: `
+				precision highp sampler2D;
+				precision highp usampler2D;
 
-					out vec4 vColor;
-					out vec2 vPosition;
-					uniform vec2 viewport;
-					uniform float focal;
-					uniform mat4 gsProjectionMatrix;
-					uniform mat4 gsModelViewMatrix;
+				out vec4 vColor;
+				out vec2 vPosition;
+				uniform vec2 viewport;
+				uniform float focal;
+				uniform mat4 gsProjectionMatrix;
+				uniform mat4 gsModelViewMatrix;
 
-					attribute uint splatIndex;
-					uniform sampler2D centerAndScaleTexture;
-					uniform usampler2D covAndColorTexture;
+				attribute uint splatIndex;
+				uniform sampler2D centerAndScaleTexture;
+				uniform usampler2D covAndColorTexture;
 
-					vec2 unpackInt16(in uint value) {
-						int v = int(value);
-						int v0 = v >> 16;
-						int v1 = (v & 0xFFFF);
-						if((v & 0x8000) != 0)
-							v1 |= 0xFFFF0000;
-						return vec2(float(v1), float(v0));
+				vec2 unpackInt16(in uint value) {
+					int v = int(value);
+					int v0 = v >> 16;
+					int v1 = (v & 0xFFFF);
+					if((v & 0x8000) != 0)
+						v1 |= 0xFFFF0000;
+					return vec2(float(v1), float(v0));
+				}
+
+				void main () {
+					ivec2 texSize = textureSize(centerAndScaleTexture, 0);
+					ivec2 texPos = ivec2(splatIndex%uint(texSize.x), splatIndex/uint(texSize.x));
+					vec4 centerAndScaleData = texelFetch(centerAndScaleTexture, texPos, 0);
+
+					vec4 center = vec4(centerAndScaleData.xyz, 1);
+					vec4 camspace = gsModelViewMatrix * center;
+					vec4 pos2d = gsProjectionMatrix * camspace;
+
+					float bounds = 1.2 * pos2d.w;
+					if (pos2d.z < -pos2d.w || pos2d.x < -bounds || pos2d.x > bounds
+						|| pos2d.y < -bounds || pos2d.y > bounds) {
+						gl_Position = vec4(0.0, 0.0, 2.0, 1.0);
+						return;
 					}
 
-					void main () {
-						ivec2 texSize = textureSize(centerAndScaleTexture, 0);
-						ivec2 texPos = ivec2(splatIndex%uint(texSize.x), splatIndex/uint(texSize.x));
-						vec4 centerAndScaleData = texelFetch(centerAndScaleTexture, texPos, 0);
+					uvec4 covAndColorData = texelFetch(covAndColorTexture, texPos, 0);
+					vec2 cov3D_M11_M12 = unpackInt16(covAndColorData.x) * centerAndScaleData.w;
+					vec2 cov3D_M13_M22 = unpackInt16(covAndColorData.y) * centerAndScaleData.w;
+					vec2 cov3D_M23_M33 = unpackInt16(covAndColorData.z) * centerAndScaleData.w;
+					mat3 Vrk = mat3(
+						cov3D_M11_M12.x, cov3D_M11_M12.y, cov3D_M13_M22.x,
+						cov3D_M11_M12.y, cov3D_M13_M22.y, cov3D_M23_M33.x,
+						cov3D_M13_M22.x, cov3D_M23_M33.x, cov3D_M23_M33.y
+					);
 
-						vec4 center = vec4(centerAndScaleData.xyz, 1);
-						vec4 camspace = gsModelViewMatrix * center;
-						vec4 pos2d = gsProjectionMatrix * camspace;
+					mat3 J = mat3(
+						focal / camspace.z, 0., -(focal * camspace.x) / (camspace.z * camspace.z), 
+						0., -focal / camspace.z, (focal * camspace.y) / (camspace.z * camspace.z), 
+						0., 0., 0.
+					);
 
-						// 移除距离检查，保持所有点都渲染
-						/*
-						float bounds = 1.2 * pos2d.w;
-						if (pos2d.z < -pos2d.w || pos2d.x < -bounds || pos2d.x > bounds
-							|| pos2d.y < -bounds || pos2d.y > bounds) {
-							gl_Position = vec4(0.0, 0.0, 2.0, 1.0);
-							return;
-						}
-						*/
+					mat3 W = transpose(mat3(gsModelViewMatrix));
+					mat3 T = W * J;
+					mat3 cov = transpose(T) * Vrk * T;
 
-						uvec4 covAndColorData = texelFetch(covAndColorTexture, texPos, 0);
-						vec2 cov3D_M11_M12 = unpackInt16(covAndColorData.x) * centerAndScaleData.w;
-						vec2 cov3D_M13_M22 = unpackInt16(covAndColorData.y) * centerAndScaleData.w;
-						vec2 cov3D_M23_M33 = unpackInt16(covAndColorData.z) * centerAndScaleData.w;
-						mat3 Vrk = mat3(
-							cov3D_M11_M12.x, cov3D_M11_M12.y, cov3D_M13_M22.x,
-							cov3D_M11_M12.y, cov3D_M13_M22.y, cov3D_M23_M33.x,
-							cov3D_M13_M22.x, cov3D_M23_M33.x, cov3D_M23_M33.y
-						);
+					vec2 vCenter = vec2(pos2d) / pos2d.w;
 
-						mat3 J = mat3(
-							focal, 0., 0.,  // 移除距离因素影响
-							0., -focal, 0.,
-							0., 0., 1.
-						);
+					float diagonal1 = cov[0][0] + 0.3;
+					float offDiagonal = cov[0][1];
+					float diagonal2 = cov[1][1] + 0.3;
 
-						mat3 W = transpose(mat3(gsModelViewMatrix));
-						mat3 T = W * J;
-						mat3 cov = transpose(T) * Vrk * T;
+					float mid = 0.5 * (diagonal1 + diagonal2);
+					float radius = length(vec2((diagonal1 - diagonal2) / 2.0, offDiagonal));
+					float lambda1 = mid + radius;
+					float lambda2 = max(mid - radius, 0.1);
+					vec2 diagonalVector = normalize(vec2(offDiagonal, lambda1 - diagonal1));
+					vec2 v1 = min(sqrt(2.0 * lambda1), 1024.0) * diagonalVector;
+					vec2 v2 = min(sqrt(2.0 * lambda2), 1024.0) * vec2(diagonalVector.y, -diagonalVector.x);
 
-						vec2 vCenter = vec2(pos2d) / pos2d.w;
+					uint colorUint = covAndColorData.w;
+					vColor = vec4(
+						float(colorUint & uint(0xFF)) / 255.0,
+						float((colorUint >> uint(8)) & uint(0xFF)) / 255.0,
+						float((colorUint >> uint(16)) & uint(0xFF)) / 255.0,
+						float(colorUint >> uint(24)) / 255.0
+					);
+					vPosition = position.xy;
 
-						float diagonal1 = cov[0][0] + 0.3;
-						float offDiagonal = cov[0][1];
-						float diagonal2 = cov[1][1] + 0.3;
-
-						float mid = 0.5 * (diagonal1 + diagonal2);
-						float radius = length(vec2((diagonal1 - diagonal2) / 2.0, offDiagonal));
-						float lambda1 = mid + radius;
-						float lambda2 = max(mid - radius, 0.1);
-
-						// 增大基础大小以保持细节
-						lambda1 *= 2.0;
-						lambda2 *= 2.0;
-
-						vec2 diagonalVector = normalize(vec2(offDiagonal, lambda1 - diagonal1));
-						// 移除大小限制，或增加限制值
-						vec2 v1 = lambda1 * diagonalVector;
-						vec2 v2 = lambda2 * vec2(diagonalVector.y, -diagonalVector.x);
-
-						uint colorUint = covAndColorData.w;
-						vColor = vec4(
-							float(colorUint & uint(0xFF)) / 255.0,
-							float((colorUint >> uint(8)) & uint(0xFF)) / 255.0,
-							float((colorUint >> uint(16)) & uint(0xFF)) / 255.0,
-							float(colorUint >> uint(24)) / 255.0
-						);
-						vPosition = position.xy;
-
-						gl_Position = vec4(
-							vCenter 
-								+ position.x * v2 / viewport * 2.0 
-								+ position.y * v1 / viewport * 2.0, 
-							pos2d.z / pos2d.w, 
-							1.0
-						);
-					}
+					gl_Position = vec4(
+						vCenter 
+							+ position.x * v2 / viewport * 2.0 
+							+ position.y * v1 / viewport * 2.0, pos2d.z / pos2d.w, 1.0);
+				}
 				`,
 			fragmentShader: `
 				in vec4 vColor;
@@ -486,6 +493,7 @@ AFRAME.registerComponent("gaussian_splatting", {
 		viewMatrix.elements[6] *= -1.0;
 		viewMatrix.elements[9] *= -1.0;
 		viewMatrix.elements[13] *= -1.0;
+	
 		const mtx = this.object.matrixWorld.clone();
 		mtx.invert();
 		mtx.elements[1] *= -1.0;
@@ -493,8 +501,25 @@ AFRAME.registerComponent("gaussian_splatting", {
 		mtx.elements[6] *= -1.0;
 		mtx.elements[9] *= -1.0;
 		mtx.elements[13] *= -1.0;
+	
+		// 添加距离映射逻辑
+		const cameraPosition = new THREE.Vector3();
+		camera.getWorldPosition(cameraPosition);
+		
+		const objectPosition = new THREE.Vector3();
+		this.object.getWorldPosition(objectPosition);
+		
+		const realDistance = cameraPosition.distanceTo(objectPosition);
+		const mappedDistance = this.mapDistance(realDistance);
+		const scale = mappedDistance / (realDistance || 0.0001); // 避免除以0
+		
+		const scaleMatrix = new THREE.Matrix4();
+		scaleMatrix.makeScale(scale, scale, scale);
+		
 		mtx.multiply(viewMatrix);
+		mtx.multiply(scaleMatrix);
 		mtx.invert();
+		
 		return mtx;
 	},
 	createWorker: function (self) {
